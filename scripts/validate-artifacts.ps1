@@ -1,29 +1,46 @@
 $ErrorActionPreference = 'Stop'
 
+# PS7 guard (для узгодженості)
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+  throw "This script requires PowerShell 7+. Please run it in pwsh (PowerShell 7)."
+}
+
 Write-Host "Reading config"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $artifactsPath = Join-Path $repoRoot "artifacts.json"
-if (-not (Test-Path $artifactsPath)) { throw "artifacts.json not found at $artifactsPath" }
+if (-not (Test-Path $artifactsPath)) {
+  throw "artifacts.json not found at $artifactsPath"
+}
 
 $config = Get-Content -Raw -Path $artifactsPath | ConvertFrom-Json
-if (-not $config.resourcesTemplate) { throw "resourcesTemplate field is missing in artifacts.json" }
+if (-not $config.resourcesTemplate) {
+  throw "resourcesTemplate field is missing in artifacts.json"
+}
 
-Write-Host "Checking if temp folder exists"
-$tempPath = Join-Path $repoRoot "temp"
-if (-not (Test-Path $tempPath)) { New-Item -ItemType Directory -Path $tempPath | Out-Null }
-
-Write-Host "Downloading artifacts"
 $uri = $config.resourcesTemplate
-# достатньо HEAD-запиту, щоб перевірити доступність
+
+# (optional) SAS expiry sanity check
 try {
-  $resp = Invoke-WebRequest -Method Head -Uri $uri -UseBasicParsing -TimeoutSec 60
+  $u = [System.Uri]$uri
+  $qs = [System.Web.HttpUtility]::ParseQueryString($u.Query)
+  $se = $qs["se"]
+  if ($se) {
+    $exp = [DateTime]::Parse($se, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+    if ($exp -lt (Get-Date).ToUniversalTime()) { throw "SAS token expired at $exp UTC." }
+  }
+} catch {
+  Write-Warning "Could not parse SAS expiry: $($_.Exception.Message)"
+}
+
+Write-Host "Validating artifact URL reachability (HEAD)..."
+try {
+  $resp = Invoke-WebRequest -Method Head -Uri $uri -TimeoutSec 60 -ErrorAction Stop
 } catch {
   throw "Failed to access artifact URL. $_"
 }
 
-Write-Host "Validating artifacts"
-if ($resp.StatusCode -ne 200) { throw "Artifact not accessible, status code: $($resp.StatusCode)" }
+if ($resp.StatusCode -ne 200) {
+  throw "Artifact not accessible, status code: $($resp.StatusCode)"
+}
 
-Write-Host "Checked if storage account exists - OK."
-Write-Host "Checked the storage account SKU - OK."
 Write-Host "Artifact URL is reachable - OK."

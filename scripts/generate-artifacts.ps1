@@ -5,94 +5,114 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# 0) PS7 guard
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+  throw "This script requires PowerShell 7+. Please run it in pwsh (PowerShell 7)."
+}
+
+# 0.1) Az module presence
+if (-not (Get-Command Get-AzContext -ErrorAction SilentlyContinue)) {
+  throw "Az module not found. Install with: Install-Module -Name Az -Repository PSGallery -Force"
+}
+
 Write-Host "Running initial validation"
 
-# 0) Перевіримо логін у Azure
+# 1) Azure context
 $ctxAzure = Get-AzContext
-if (-not $ctxAzure) { throw "Not connected to Azure. Run Connect-AzAccount first." }
-Write-Host "Azure Powershell module is installed, account is connected."
+if (-not $ctxAzure) {
+  throw "Not connected to Azure. Run Connect-AzAccount (use -UseDeviceAuthentication when over SSH)."
+}
+Write-Host "Azure module available, account is connected."
 
-# 1) Константи завдання
+# 2) Task constants
 $resourceGroup = "mate-resources"
 $containerName = "task-artifacts"
-$taskFolder = "task1"
+$taskFolder    = "task1"
 
-# 2) Знайдемо Storage Account і контейнер
+# 3) Storage account + container
 Write-Host "Checking if storage account exists"
 $sa = Get-AzStorageAccount -ResourceGroupName $resourceGroup -Name $ArtifactsStorageAccountName -ErrorAction Stop
-if (-not $sa) { throw "Storage account $ArtifactsStorageAccountName not found in RG $resourceGroup" }
 Write-Host "Storage account found"
 
 Write-Host "Checking if artifacts storage container exists"
 $ctx = $sa.Context
 $container = Get-AzStorageContainer -Context $ctx -Name $containerName -ErrorAction SilentlyContinue
 if (-not $container) {
-  throw "Unable to find a storage container $containerName in the storage account $ArtifactsStorageAccountName, please make sure that it's created"
+  throw "Unable to find a storage container '$containerName' in storage account '$ArtifactsStorageAccountName'. Please create it first."
 }
 Write-Host "Storage container for artifacts found!"
 
-# 3) Готуємо тимчасову директорію
-Write-Host "Generating artifacts"
+# 4) repo root / temp
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $tempPath = Join-Path $repoRoot "temp"
-Write-Host "Checking if temp folder exists"
-if (-not (Test-Path $tempPath)) {
-  Write-Host "Temp folder does not exist, creating..."
-  New-Item -Path $tempPath -ItemType Directory | Out-Null
-}
+if (-not (Test-Path $tempPath)) { New-Item -Path $tempPath -ItemType Directory | Out-Null }
 
-# 4) Згенеруємо простий артефакт (JSON із тех.інфою)
-#    За потреби тут можна покласти будь-який реальний експорт ресурсів
+# 5) generate artifact (demo JSON)
 $artifactLocalPath = Join-Path $tempPath "exported-template.json"
 $payload = [ordered]@{
-  generatedAtUtc  = (Get-Date).ToUniversalTime().ToString("o")
-  subscriptionId  = $ctxAzure.Subscription.Id
-  tenantId        = $ctxAzure.Tenant.Id
-  storageAccount  = $ArtifactsStorageAccountName
-  resourceGroup   = $resourceGroup
-  note            = "Mate Academy Azure Lab Setup artifact"
+  generatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+  subscriptionId = $ctxAzure.Subscription.Id
+  tenantId       = $ctxAzure.Tenant.Id
+  storageAccount = $ArtifactsStorageAccountName
+  resourceGroup  = $resourceGroup
+  note           = "Mate Academy Azure Lab Setup artifact"
 } | ConvertTo-Json -Depth 5
 $payload | Set-Content -Path $artifactLocalPath -Encoding UTF8
+Write-Host "Exported artifact at: $artifactLocalPath"
 
-Write-Host ""
-Write-Host "Exporting resources template"
-Write-Host ""
-Write-Host "Path : $artifactLocalPath"
-Write-Host ""
-
-# 5) Завантажимо у Blob Storage
-Write-Host "Uploading resources template"
+# 6) upload artifact
 $blobPath = "$taskFolder/exported-template.json"
 Set-AzStorageBlobContent -Context $ctx -File $artifactLocalPath -Container $containerName -Blob $blobPath -Force | Out-Null
+Write-Host "Uploaded blob: $containerName/$blobPath"
 
-# 6) Згенеруємо SAS URL (читання на 30 днів)
-Write-Host "Generating a SAS token for the template artifact"
+# 7) SAS generation with fallback
 $expiry = (Get-Date).ToUniversalTime().AddDays(30)
-$sasUrl = New-AzStorageBlobSASToken -Context $ctx -Container $containerName -Blob $blobPath -Permission r -ExpiryTime $expiry -FullUri
-
-# 7) Оновимо artifacts.json in-place
-Write-Host "Updating artifacts config"
-$artifactsPath = Join-Path $repoRoot "artifacts.json"
-$artifactsObj = [ordered]@{
-  resourcesTemplate = $sasUrl
-}
-($artifactsObj | ConvertTo-Json) | Set-Content -Path $artifactsPath -Encoding UTF8
-
-# 8) Закомітимо зміни (тільки artifacts.json)
+$sasUrl = $null
+Write-Host "Generating SAS token..."
 try {
-  Push-Location $repoRoot
-  git add artifacts.json | Out-Null
-  # Комітим лише якщо справді є зміни
-  $hasChanges = (git status --porcelain | Select-String "artifacts.json")
-  if ($hasChanges) {
-    git commit -m "chore: generate artifacts for task1 via script" | Out-Null
-    Write-Host "Committed artifacts.json"
+  $sasUrl = New-AzStorageBlobSASToken -Context $ctx -Container $containerName -Blob $blobPath -Permission r -ExpiryTime $expiry -FullUri
+} catch {
+  Write-Warning "Implicit context SAS failed. Trying with account key..."
+  try {
+    $acctKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroup -Name $ArtifactsStorageAccountName | Select-Object -First 1).Value
+    if (-not $acctKey) { throw "No storage account key returned." }
+    $ctxWithKey = New-AzStorageContext -StorageAccountName $ArtifactsStorageAccountName -StorageAccountKey $acctKey
+    $sasUrl = New-AzStorageBlobSASToken -Context $ctxWithKey -Container $containerName -Blob $blobPath -Permission r -ExpiryTime $expiry -FullUri
+  } catch {
+    throw "Unable to generate SAS URL. Ensure permissions to read storage keys. Details: $($_.Exception.Message)"
+  }
+}
+Write-Host "SAS URL generated."
+
+# 8) update artifacts.json in-place
+$artifactsPath = Join-Path $repoRoot "artifacts.json"
+$artifactsObj = [ordered]@{ resourcesTemplate = $sasUrl }
+($artifactsObj | ConvertTo-Json) | Set-Content -Path $artifactsPath -Encoding UTF8
+Write-Host "Updated artifacts.json"
+
+# 9) robust git commit
+Push-Location $repoRoot
+try {
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Warning "git not found. Skipping commit. Please commit artifacts.json manually."
+  } elseif (-not (& git rev-parse --is-inside-work-tree 2>$null)) {
+    Write-Warning "Not inside a git repository. Skipping commit. Please commit manually."
   } else {
-    Write-Host "No changes to commit in artifacts.json"
+    & git add artifacts.json | Out-Null
+    $dirty = & git status --porcelain | Select-String "artifacts.json"
+    if ($dirty) {
+      try {
+        & git -c user.useConfigOnly=true commit -m "chore: generate artifacts for task1 via script" | Out-Null
+        Write-Host "Committed artifacts.json"
+      } catch {
+        Write-Warning "Git commit failed: $($_.Exception.Message). Please commit manually."
+      }
+    } else {
+      Write-Host "No changes to commit in artifacts.json"
+    }
   }
 } finally {
   Pop-Location
 }
 
-Write-Host ""
-Write-Host "Done. artifacts.json is updated and committed."
+Write-Host "Done."
