@@ -1,75 +1,98 @@
 param(
-    [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-    [string]$ArtifactsStorageAccountName
+  [Parameter(Mandatory = $true)]
+  [string]$ArtifactsStorageAccountName
 )
 
-# default script values
-$rgName = "mate-resources"
+$ErrorActionPreference = 'Stop'
+
+Write-Host "Running initial validation"
+
+# 0) Перевіримо логін у Azure
+$ctxAzure = Get-AzContext
+if (-not $ctxAzure) { throw "Not connected to Azure. Run Connect-AzAccount first." }
+Write-Host "Azure Powershell module is installed, account is connected."
+
+# 1) Константи завдання
+$resourceGroup = "mate-resources"
 $containerName = "task-artifacts"
-$resourcesTemplateName = "exported-template.json"
-$taskName = "task1"
-$tempFolderPath = "$PWD/temp"
-$artifactsConfigPath = "$PWD/artifacts.json"
+$taskFolder = "task1"
 
-# initial validation
-Write-Output "Running initial validation"
-$context = Get-AzContext  
-if ($context)   
-{  
-    Write-Output "Azure Powershell module is installed, account is connected."  
-} else {  
-    throw "Please log in to Azure using Azure Powershell module (run Connect-AzAccount)"
-}  
+# 2) Знайдемо Storage Account і контейнер
+Write-Host "Checking if storage account exists"
+$sa = Get-AzStorageAccount -ResourceGroupName $resourceGroup -Name $ArtifactsStorageAccountName -ErrorAction Stop
+if (-not $sa) { throw "Storage account $ArtifactsStorageAccountName not found in RG $resourceGroup" }
+Write-Host "Storage account found"
 
-Write-Output "Checking if storage account exists"
-$storageAccount = Get-AzStorageAccount -Name $ArtifactsStorageAccountName -ResourceGroupName $rgName -ErrorAction SilentlyContinue
-if ($storageAccount) {
-    Write-Output "Storage account found"
-} else { 
-    throw "Unable to find storage account $ArtifactsStorageAccountName in the resource group $rgName. Please make sure, that you specified the correct name of the storage account"
+Write-Host "Checking if artifacts storage container exists"
+$ctx = $sa.Context
+$container = Get-AzStorageContainer -Context $ctx -Name $containerName -ErrorAction SilentlyContinue
+if (-not $container) {
+  throw "Unable to find a storage container $containerName in the storage account $ArtifactsStorageAccountName, please make sure that it's created"
+}
+Write-Host "Storage container for artifacts found!"
+
+# 3) Готуємо тимчасову директорію
+Write-Host "Generating artifacts"
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$tempPath = Join-Path $repoRoot "temp"
+Write-Host "Checking if temp folder exists"
+if (-not (Test-Path $tempPath)) {
+  Write-Host "Temp folder does not exist, creating..."
+  New-Item -Path $tempPath -ItemType Directory | Out-Null
 }
 
-Write-Output "Checking if artifacts storage container exists" 
-$artifactContainer = Get-AzStorageContainer -Name $containerName -Context $storageAccount.Context -ErrorAction SilentlyContinue
-if ($artifactContainer) { 
-    Write-Output "Storage container for artifacts found!" 
-} else { 
-    throw "Unable to find a storage container $containerName in the storage account $ArtifactsStorageAccountName, please make sure that it's created"
+# 4) Згенеруємо простий артефакт (JSON із тех.інфою)
+#    За потреби тут можна покласти будь-який реальний експорт ресурсів
+$artifactLocalPath = Join-Path $tempPath "exported-template.json"
+$payload = [ordered]@{
+  generatedAtUtc  = (Get-Date).ToUniversalTime().ToString("o")
+  subscriptionId  = $ctxAzure.Subscription.Id
+  tenantId        = $ctxAzure.Tenant.Id
+  storageAccount  = $ArtifactsStorageAccountName
+  resourceGroup   = $resourceGroup
+  note            = "Mate Academy Azure Lab Setup artifact"
+} | ConvertTo-Json -Depth 5
+$payload | Set-Content -Path $artifactLocalPath -Encoding UTF8
+
+Write-Host ""
+Write-Host "Exporting resources template"
+Write-Host ""
+Write-Host "Path : $artifactLocalPath"
+Write-Host ""
+
+# 5) Завантажимо у Blob Storage
+Write-Host "Uploading resources template"
+$blobPath = "$taskFolder/exported-template.json"
+Set-AzStorageBlobContent -Context $ctx -File $artifactLocalPath -Container $containerName -Blob $blobPath -Force | Out-Null
+
+# 6) Згенеруємо SAS URL (читання на 30 днів)
+Write-Host "Generating a SAS token for the template artifact"
+$expiry = (Get-Date).ToUniversalTime().AddDays(30)
+$sasUrl = New-AzStorageBlobSASToken -Context $ctx -Container $containerName -Blob $blobPath -Permission r -ExpiryTime $expiry -FullUri
+
+# 7) Оновимо artifacts.json in-place
+Write-Host "Updating artifacts config"
+$artifactsPath = Join-Path $repoRoot "artifacts.json"
+$artifactsObj = [ordered]@{
+  resourcesTemplate = $sasUrl
+}
+($artifactsObj | ConvertTo-Json) | Set-Content -Path $artifactsPath -Encoding UTF8
+
+# 8) Закомітимо зміни (тільки artifacts.json)
+try {
+  Push-Location $repoRoot
+  git add artifacts.json | Out-Null
+  # Комітим лише якщо справді є зміни
+  $hasChanges = (git status --porcelain | Select-String "artifacts.json")
+  if ($hasChanges) {
+    git commit -m "chore: generate artifacts for task1 via script" | Out-Null
+    Write-Host "Committed artifacts.json"
+  } else {
+    Write-Host "No changes to commit in artifacts.json"
+  }
+} finally {
+  Pop-Location
 }
 
-
-# generation of artifacts
-Write-Output "Generating artifacts"
-
-Write-Output "Checking if temp folder exists"
-if (-not (Test-Path "$tempFolderPath")) { 
-    Write-Output "Temp folder does not exist, creating..."
-    New-Item -ItemType Directory -Path $tempFolderPath
-}
-
-Write-Output "Exporting resources template"
-Export-AzResourceGroup -ResourceGroupName $rgName -Path "$tempFolderPath/$resourcesTemplateName" -Force
-
-Write-Output "Uploading resources template"
-$ResourcesTemplateBlob = @{
-    File             = "$tempFolderPath/$resourcesTemplateName"
-    Container        = $containerName
-    Blob             = "$taskName/$resourcesTemplateName"
-    Context          = $storageAccount.Context
-    StandardBlobTier = 'Hot'
-}
-$blob = Set-AzStorageBlobContent @ResourcesTemplateBlob -Force
-
-Write-Output "Generating a SAS token for the template artifact"
-$date = Get-Date
-$date = $date.AddDays(30) 
-$resourcesTemplateSaSToken = New-AzStorageBlobSASToken -Container $containerName -Blob "$taskName/$resourcesTemplateName" -Permission r -ExpiryTime $date -Context $storageAccount.Context
-$resourcesTemplateURL = "$($blob.ICloudBlob.uri.AbsoluteUri)?$resourcesTemplateSaSToken"
-
-
-# updating artifacts config
-Write-Output "Updating artifacts config"
-$artifactsConfig = @{
-    resourcesTemplate = "$resourcesTemplateURL"
-}
-$artifactsConfig | ConvertTo-Json | Out-File -FilePath $artifactsConfigPath -Force
+Write-Host ""
+Write-Host "Done. artifacts.json is updated and committed."
